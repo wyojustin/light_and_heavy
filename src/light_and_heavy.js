@@ -163,6 +163,22 @@ function onMessageArrived(message) {
   }
 }
 
+// --- New startMQTT function ---
+function startMQTT() {
+  if (!mqttConnected) {
+    console.log("Starting MQTT connection with secret:", secret);
+    mqttClient.connect({
+      onSuccess: onConnect,
+      onFailure: function(error) {
+        console.error("MQTT connection failed:", error.errorMessage);
+      },
+      useSSL: true
+    });
+  } else {
+    console.log("MQTT is already connected.");
+  }
+}
+
 // === Tap-Tap Methods for Mobile Devices ===
 function handleTapStack(e) {
   // Prevent event bubbling so board tap doesn't fire.
