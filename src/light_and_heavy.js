@@ -39,28 +39,74 @@ function clearChallenge() {
 const mqttClient = new Paho.MQTT.Client("mqtt.eclipseprojects.io", 443, "/mqtt", clientId);
 mqttClient.onMessageArrived = onMessageArrived;
 
+// Add this new function to clear the challenge accepted topic.
+function clearChallengeAccepted() {
+  const msg = new Paho.MQTT.Message("");
+  msg.destinationName = "light_and_heavy/challenge_accepted";
+  msg.retained = true;
+  mqttClient.send(msg);
+  console.log("Cleared challenge accepted message.");
+}
+
+// Combine clearing both handshake topics.
+function clearHandshakeTopics() {
+  clearChallenge();
+  clearChallengeAccepted();
+}
+
+
 function onConnect() {
   mqttConnected = true;
   console.log("MQTT connected as", clientId);
+  
+  // Subscribe to handshake topics.
   mqttClient.subscribe("light_and_heavy/challenge");
   mqttClient.subscribe("light_and_heavy/challenge_accepted");
   mqttClient.subscribe("light_and_heavy/move");
   
-  // Resend challenge after 3 seconds if none received.
+  // Immediately clear any stale retained messages.
+  clearChallenge();          // clears light_and_heavy/challenge
+  clearChallengeAccepted();  // clears light_and_heavy/challenge_accepted
+  
+  // Wait one second for the broker to propagate the clear messages.
   setTimeout(() => {
-    if (!challengeReceived) {
-      myNonce = "nonce_" + Math.random().toString(16).substr(2, 8);
-      console.log("Resending challenge with new nonce:", myNonce);
-      const msgObj = { move: moveNumber, nonce: myNonce, hmac: computeHMAC(moveNumber + myNonce), clientId };
-      const payload = JSON.stringify(msgObj);
-      const msg = new Paho.MQTT.Message(payload);
-      msg.destinationName = "light_and_heavy/challenge";
-      msg.retained = true;
-      mqttClient.send(msg);
-      myChallengePosted = true;
-      console.log("Posted challenge:", payload);
-    }
-  }, 3000);
+    // Now send a new challenge message.
+    myNonce = "nonce_" + Math.random().toString(16).substr(2, 8);
+    const msgObj = {
+      move: moveNumber,
+      nonce: myNonce,
+      hmac: computeHMAC(moveNumber + myNonce),
+      clientId
+    };
+    const payload = JSON.stringify(msgObj);
+    const msg = new Paho.MQTT.Message(payload);
+    msg.destinationName = "light_and_heavy/challenge";
+    msg.retained = true;
+    mqttClient.send(msg);
+    myChallengePosted = true;
+    console.log("Posted challenge:", payload);
+    
+    // Set a retry timer in case no valid handshake occurs within 3 seconds.
+    setTimeout(() => {
+      if (!challengeReceived) {
+        myNonce = "nonce_" + Math.random().toString(16).substr(2, 8);
+        console.log("Resending challenge with new nonce:", myNonce);
+        const msgObj = {
+          move: moveNumber,
+          nonce: myNonce,
+          hmac: computeHMAC(moveNumber + myNonce),
+          clientId
+        };
+        const payload = JSON.stringify(msgObj);
+        const msg = new Paho.MQTT.Message(payload);
+        msg.destinationName = "light_and_heavy/challenge";
+        msg.retained = true;
+        mqttClient.send(msg);
+        myChallengePosted = true;
+        console.log("Posted challenge:", payload);
+      }
+    }, 3000);
+  }, 1000);
 }
 
 function onMessageArrived(message) {
