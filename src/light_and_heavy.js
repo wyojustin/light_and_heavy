@@ -1,4 +1,4 @@
-// light_and_heavy.js v3.10.3
+// light_and_heavy.js v3.10.4
 console.log("light_and_heavy.js loaded");
 
 // === Constants & Global Variables ===
@@ -50,6 +50,16 @@ function clearChallengeAccepted() {
 function clearHandshakeTopics() {
   clearChallenge();
   clearChallengeAccepted();
+}
+
+// Check for a draw condition: return true if no cell is empty.
+function checkDraw() {
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (boardState[r][c] === '.') return false;
+    }
+  }
+  return true;
 }
 
 // === MQTT Setup & Handshake ===
@@ -243,9 +253,25 @@ function handleTapBoard(e) {
   updatePlayerStacks();
   publishMove(col, selectedMove.moveType);
   
-  turn = (turn === 1) ? 2 : 1;
-  updateDraggableStacks();
-  gameMoveNumber++;
+  // Check for win.
+  let winData = checkWin();
+  if (winData) {
+    endGame(winData);
+  }
+  // Check for draw.
+  else if (checkDraw()) {
+    gameOver = true;
+    console.log("Game over: Draw");
+    document.getElementById("winMessage").innerText = "Draw";
+    document.getElementById("winOverlay").style.display = "flex";
+    // For the next game, let the opposite player start.
+    lastLoser = (selectedMove.player === 1) ? 2 : 1;
+  }
+  else {
+    turn = (turn === 1) ? 2 : 1;
+    updateDraggableStacks();
+    gameMoveNumber++;
+  }
   
   selectedMove = null;
   document.querySelectorAll('.checker').forEach(ch => ch.classList.remove('selected'));
@@ -514,8 +540,20 @@ document.addEventListener('mouseup', function(e) {
   publishMove(col, currentMoveType);
   updatePlayerStacks();
   let winData = checkWin();
-  if (winData) { endGame(winData); }
-  else { turn = (turn === 1) ? 2 : 1; updateDraggableStacks(); gameMoveNumber++; }
+  if (winData) {
+    endGame(winData);
+  } else if (checkDraw()) {
+    gameOver = true;
+    console.log("Game over: Draw");
+    document.getElementById("winMessage").innerText = "Draw";
+    document.getElementById("winOverlay").style.display = "flex";
+    // For next game, let the opposite player start.
+    lastLoser = (turn === 1) ? 2 : 1;
+  } else {
+    turn = (turn === 1) ? 2 : 1;
+    updateDraggableStacks();
+    gameMoveNumber++;
+  }
   draggingPlayer = null;
 });
 
@@ -755,6 +793,7 @@ function processRemoteMove(msgObj) {
   console.log("Remote move processed. New gameMoveNumber:", gameMoveNumber);
 }
 
+// Continuously check if handshake negotiation is complete.
 function checkNegotiationComplete() {
   if (playerRole !== null) { console.log("Negotiation complete. I am Player", playerRole); updateDraggableStacks(); }
   else { setTimeout(checkNegotiationComplete, 500); }
@@ -810,4 +849,4 @@ function resetGame() {
 }
 window.resetGame = resetGame;
 
-// End of light_and_heavy.js v3.10.3
+// End of light_and_heavy.js v3.10.4
