@@ -1,4 +1,4 @@
-// light_and_heavy.js v3.10.2
+// light_and_heavy.js v3.10.3
 console.log("light_and_heavy.js loaded");
 
 // === Constants & Global Variables ===
@@ -21,6 +21,10 @@ let playerRole = null, turn = 1, gameMoveNumber = 1, lastLoser = null;
 const INITIAL_LIGHT = 11;
 const INITIAL_HEAVY = 10;
 
+// === New Global Variables for Tap Mode ===
+let selectedMove = null;
+const isTapMode = ('ontouchstart' in window);
+
 // === Helper Functions ===
 function computeHMAC(message) {
   return CryptoJS.HmacSHA256(message, secret).toString();
@@ -35,11 +39,6 @@ function clearChallenge() {
   console.log("Cleared challenge message.");
 }
 
-// === MQTT Setup & Handshake ===
-const mqttClient = new Paho.MQTT.Client("mqtt.eclipseprojects.io", 443, "/mqtt", clientId);
-mqttClient.onMessageArrived = onMessageArrived;
-
-// Add this new function to clear the challenge accepted topic.
 function clearChallengeAccepted() {
   const msg = new Paho.MQTT.Message("");
   msg.destinationName = "light_and_heavy/challenge_accepted";
@@ -48,36 +47,30 @@ function clearChallengeAccepted() {
   console.log("Cleared challenge accepted message.");
 }
 
-// Combine clearing both handshake topics.
 function clearHandshakeTopics() {
   clearChallenge();
   clearChallengeAccepted();
 }
 
+// === MQTT Setup & Handshake ===
+const mqttClient = new Paho.MQTT.Client("mqtt.eclipseprojects.io", 443, "/mqtt", clientId);
+mqttClient.onMessageArrived = onMessageArrived;
 
 function onConnect() {
   mqttConnected = true;
   console.log("MQTT connected as", clientId);
   
-  // Subscribe to handshake topics.
   mqttClient.subscribe("light_and_heavy/challenge");
   mqttClient.subscribe("light_and_heavy/challenge_accepted");
   mqttClient.subscribe("light_and_heavy/move");
   
-  // Immediately clear any stale retained messages.
-  clearChallenge();          // clears light_and_heavy/challenge
-  clearChallengeAccepted();  // clears light_and_heavy/challenge_accepted
+  // Clear any stale handshake messages.
+  clearHandshakeTopics();
   
-  // Wait one second for the broker to propagate the clear messages.
+  // Wait one second for clears to propagate, then send a new challenge.
   setTimeout(() => {
-    // Now send a new challenge message.
     myNonce = "nonce_" + Math.random().toString(16).substr(2, 8);
-    const msgObj = {
-      move: moveNumber,
-      nonce: myNonce,
-      hmac: computeHMAC(moveNumber + myNonce),
-      clientId
-    };
+    const msgObj = { move: moveNumber, nonce: myNonce, hmac: computeHMAC(moveNumber + myNonce), clientId };
     const payload = JSON.stringify(msgObj);
     const msg = new Paho.MQTT.Message(payload);
     msg.destinationName = "light_and_heavy/challenge";
@@ -86,17 +79,12 @@ function onConnect() {
     myChallengePosted = true;
     console.log("Posted challenge:", payload);
     
-    // Set a retry timer in case no valid handshake occurs within 3 seconds.
+    // Set a retry timer if no valid challenge is received.
     setTimeout(() => {
       if (!challengeReceived) {
         myNonce = "nonce_" + Math.random().toString(16).substr(2, 8);
         console.log("Resending challenge with new nonce:", myNonce);
-        const msgObj = {
-          move: moveNumber,
-          nonce: myNonce,
-          hmac: computeHMAC(moveNumber + myNonce),
-          clientId
-        };
+        const msgObj = { move: moveNumber, nonce: myNonce, hmac: computeHMAC(moveNumber + myNonce), clientId };
         const payload = JSON.stringify(msgObj);
         const msg = new Paho.MQTT.Message(payload);
         msg.destinationName = "light_and_heavy/challenge";
@@ -158,7 +146,7 @@ function onMessageArrived(message) {
     if (gameOver) return;
     if (msgObj.move === moveNumber && msgObj.hmac === computeHMAC(moveNumber + msgObj.nonce)) {
       console.log("Received valid challenge accepted from", msgObj.clientId);
-      challengeReceived = true; // Mark handshake as complete.
+      challengeReceived = true;
       if (myChallengePosted && msgObj.clientId !== clientId && playerRole === null) {
         playerRole = (clientId < msgObj.clientId) ? 1 : 2;
       }
@@ -175,130 +163,76 @@ function onMessageArrived(message) {
   }
 }
 
-
-function onMessageArrived_xx(message) {
-  console.log("MQTT message on", message.destinationName, ":", message.payloadString);
+// === Tap-Tap Methods for Mobile Devices ===
+function handleTapStack(e) {
+  // Prevent event bubbling so board tap doesn't fire.
+  e.stopPropagation();
   
-  // Guard: skip processing if the payload is empty or only whitespace.
-  if (message.payloadString.trim() === "") {
-    console.log("Empty message received on", message.destinationName, "- ignoring.");
+  if (gameOver || playerRole !== turn) return;
+  
+  selectedMove = {
+    moveType: this.getAttribute('data-move-type'),
+    player: parseInt(this.getAttribute('data-player')),
+    color: (parseInt(this.getAttribute('data-player')) === 1)
+           ? (this.getAttribute('data-move-type') === 'heavy' ? COLORS[1].heavy : COLORS[1].light)
+           : (this.getAttribute('data-move-type') === 'heavy' ? COLORS[2].heavy : COLORS[2].light)
+  };
+  console.log("Tap mode selected move:", selectedMove);
+  
+  // Add visual indicator.
+  document.querySelectorAll('.checker').forEach(ch => ch.classList.remove('selected'));
+  this.classList.add('selected');
+}
+
+function handleTapBoard(e) {
+  if (!selectedMove) return;
+  
+  const board = document.getElementById('board');
+  const rect = board.getBoundingClientRect();
+  const x = e.clientX - rect.left - 10; // Adjust for board padding.
+  const col = Math.floor(x / 80); // 70px cell + 10px gap = 80px.
+  if (col < 0 || col >= COLS) {
+    console.log("Tap outside valid board area.");
     return;
   }
   
-  let msgObj;
-  try {
-    msgObj = JSON.parse(message.payloadString);
-  } catch (e) {
-    console.log("Invalid JSON:", e);
+  let targetRow = -1;
+  for (let r = ROWS - 1; r >= 0; r--) {
+    if (boardState[r][col] === '.') {
+      targetRow = r;
+      break;
+    }
+  }
+  if (targetRow === -1) {
+    console.log("Column is full.");
+    selectedMove = null;
+    document.querySelectorAll('.checker').forEach(ch => ch.classList.remove('selected'));
     return;
   }
   
-  if (message.destinationName === "light_and_heavy/challenge") {
-    if (gameOver) {
-      document.querySelector("#winOverlay button").innerText = "Accept Challenge";
-      return;
-    }
-    if (msgObj.nonce === myNonce) {
-      console.log("Ignoring own challenge message.");
-      return;
-    }
-    if (msgObj.move === moveNumber && msgObj.hmac === computeHMAC(moveNumber + msgObj.nonce)) {
-      challengeReceived = true;
-      console.log("Received valid challenge from", msgObj.clientId);
-      if (msgObj.clientId !== clientId && playerRole === null) {
-        playerRole = (clientId < msgObj.clientId) ? 1 : 2;
-      }
-      if (msgObj.clientId !== clientId && playerRole === 2) {
-        const acceptObj = { move: moveNumber, nonce: myNonce, hmac: computeHMAC(moveNumber + myNonce), clientId };
-        const payload = JSON.stringify(acceptObj);
-        const msg = new Paho.MQTT.Message(payload);
-        msg.destinationName = "light_and_heavy/challenge_accepted";
-        msg.retained = true;
-        mqttClient.send(msg);
-        console.log("Published challenge accepted:", payload);
-      }
-      clearChallenge(); // Handshake complete, clear challenge.
-    } else {
-      console.log("Received invalid challenge or for a different move.");
-    }
-  } else if (message.destinationName === "light_and_heavy/challenge_accepted") {
-    if (gameOver) return;
-    if (msgObj.move === moveNumber && msgObj.hmac === computeHMAC(moveNumber + msgObj.nonce)) {
-      console.log("Received valid challenge accepted from", msgObj.clientId);
-      if (myChallengePosted && msgObj.clientId !== clientId && playerRole === null) {
-        playerRole = (clientId < msgObj.clientId) ? 1 : 2;
-      }
-    }
-  } else if (message.destinationName === "light_and_heavy/move") {
-    if (msgObj.clientId === clientId) return;
-    if (msgObj.move === gameMoveNumber &&
-        msgObj.hmac === computeHMAC(msgObj.move + msgObj.col + msgObj.type + msgObj.nonce + msgObj.color)) {
-      console.log("Processing remote move:", msgObj);
-      processRemoteMove(msgObj);
-    } else {
-      console.log("Received invalid move message.");
-    }
+  if (selectedMove.moveType === 'heavy') {
+    targetRow = placeHeavyPiece(col, selectedMove.player === 1 ? 'Y' : 'R');
+  } else {
+    targetRow = placeLightPiece(col, selectedMove.player === 1 ? 'y' : 'r');
   }
-}
-
-function onMessageArrivedold(message) {
-  console.log("MQTT message on", message.destinationName, ":", message.payloadString);
-  let msgObj;
-  try { msgObj = JSON.parse(message.payloadString); } catch (e) { console.log("Invalid JSON:", e); return; }
   
-  if (message.destinationName === "light_and_heavy/challenge") {
-    if (gameOver) { document.querySelector("#winOverlay button").innerText = "Accept Challenge"; return; }
-    if (msgObj.nonce === myNonce) { console.log("Ignoring own challenge message."); return; }
-    if (msgObj.move === moveNumber && msgObj.hmac === computeHMAC(moveNumber + msgObj.nonce)) {
-      challengeReceived = true;
-      console.log("Received valid challenge from", msgObj.clientId);
-      if (msgObj.clientId !== clientId && playerRole === null)
-        playerRole = (clientId < msgObj.clientId) ? 1 : 2;
-      if (msgObj.clientId !== clientId && playerRole === 2) {
-        const acceptObj = { move: moveNumber, nonce: myNonce, hmac: computeHMAC(moveNumber + myNonce), clientId };
-        const payload = JSON.stringify(acceptObj);
-        const msg = new Paho.MQTT.Message(payload);
-        msg.destinationName = "light_and_heavy/challenge_accepted";
-        msg.retained = true;
-        mqttClient.send(msg);
-        console.log("Published challenge accepted:", payload);
-      }
-      clearChallenge(); // Handshake complete, clear challenge.
-    } else { console.log("Received invalid challenge or for a different move."); }
-  } else if (message.destinationName === "light_and_heavy/challenge_accepted") {
-    if (gameOver) return;
-    if (msgObj.move === moveNumber && msgObj.hmac === computeHMAC(moveNumber + msgObj.nonce)) {
-      console.log("Received valid challenge accepted from", msgObj.clientId);
-      if (myChallengePosted && msgObj.clientId !== clientId && playerRole === null)
-        playerRole = (clientId < msgObj.clientId) ? 1 : 2;
-    }
-  } else if (message.destinationName === "light_and_heavy/move") {
-    if (msgObj.clientId === clientId) return;
-    if (msgObj.move === gameMoveNumber &&
-        msgObj.hmac === computeHMAC(msgObj.move + msgObj.col + msgObj.type + msgObj.nonce + msgObj.color)) {
-      console.log("Processing remote move:", msgObj);
-      processRemoteMove(msgObj);
-    } else { console.log("Received invalid move message."); }
+  if (targetRow === null) {
+    console.log("Failed to place piece, returning to stack.");
+    selectedMove = null;
+    document.querySelectorAll('.checker').forEach(ch => ch.classList.remove('selected'));
+    return;
   }
-}
-
-function startMQTT(retryCount) {
-  retryCount = retryCount || 0;
-  if (!mqttConnected) {
-    console.log("Starting MQTT connection with secret:", secret);
-    mqttClient.connect({
-      onSuccess: onConnect,
-      onFailure: function(error) {
-        console.error("MQTT connection failed:", error.errorMessage);
-        if (retryCount < 3) {
-          setTimeout(() => { startMQTT(retryCount + 1); }, 2000);
-        } else {
-          alert("Unable to connect after multiple attempts. Please check your connection.");
-        }
-      },
-      useSSL: true
-    });
-  } else { console.log("MQTT is already connected."); }
+  
+  redrawBoard();
+  updatePlayerStacks();
+  publishMove(col, selectedMove.moveType);
+  
+  turn = (turn === 1) ? 2 : 1;
+  updateDraggableStacks();
+  gameMoveNumber++;
+  
+  selectedMove = null;
+  document.querySelectorAll('.checker').forEach(ch => ch.classList.remove('selected'));
 }
 
 // === Game Setup & Rendering ===
@@ -318,20 +252,28 @@ function createPlayerStacks(player) {
   let heavyCount = INITIAL_HEAVY;
   for (let i = 0; i < lightCount; i++) {
     let checker = document.createElement('div');
-    checker.classList.add('checker','stack-checker');
+    checker.classList.add('checker', 'stack-checker');
     checker.style.backgroundColor = (player === 1 ? COLORS[1].light : COLORS[2].light);
     checker.setAttribute('data-player', player);
     checker.setAttribute('data-move-type', 'light');
-    checker.addEventListener('mousedown', handleMouseDown);
+    if (isTapMode) {
+      checker.addEventListener('click', handleTapStack);
+    } else {
+      checker.addEventListener('mousedown', handleMouseDown);
+    }
     containerLight.appendChild(checker);
   }
   for (let i = 0; i < heavyCount; i++) {
     let checker = document.createElement('div');
-    checker.classList.add('checker','stack-checker');
+    checker.classList.add('checker', 'stack-checker');
     checker.style.backgroundColor = (player === 1 ? COLORS[1].heavy : COLORS[2].heavy);
     checker.setAttribute('data-player', player);
     checker.setAttribute('data-move-type', 'heavy');
-    checker.addEventListener('mousedown', handleMouseDown);
+    if (isTapMode) {
+      checker.addEventListener('click', handleTapStack);
+    } else {
+      checker.addEventListener('mousedown', handleMouseDown);
+    }
     containerHeavy.appendChild(checker);
   }
 }
@@ -362,7 +304,11 @@ function updatePlayerStacks() {
     checker.style.backgroundColor = COLORS[1].light;
     checker.setAttribute('data-player', 1);
     checker.setAttribute('data-move-type', 'light');
-    checker.addEventListener('mousedown', handleMouseDown);
+    if (isTapMode) {
+      checker.addEventListener('click', handleTapStack);
+    } else {
+      checker.addEventListener('mousedown', handleMouseDown);
+    }
     p1LightContainer.appendChild(checker);
   }
   for (let i = 0; i < p1HeavyRemaining; i++) {
@@ -371,7 +317,11 @@ function updatePlayerStacks() {
     checker.style.backgroundColor = COLORS[1].heavy;
     checker.setAttribute('data-player', 1);
     checker.setAttribute('data-move-type', 'heavy');
-    checker.addEventListener('mousedown', handleMouseDown);
+    if (isTapMode) {
+      checker.addEventListener('click', handleTapStack);
+    } else {
+      checker.addEventListener('mousedown', handleMouseDown);
+    }
     p1HeavyContainer.appendChild(checker);
   }
   
@@ -385,7 +335,11 @@ function updatePlayerStacks() {
     checker.style.backgroundColor = COLORS[2].light;
     checker.setAttribute('data-player', 2);
     checker.setAttribute('data-move-type', 'light');
-    checker.addEventListener('mousedown', handleMouseDown);
+    if (isTapMode) {
+      checker.addEventListener('click', handleTapStack);
+    } else {
+      checker.addEventListener('mousedown', handleMouseDown);
+    }
     p2LightContainer.appendChild(checker);
   }
   for (let i = 0; i < p2HeavyRemaining; i++) {
@@ -394,7 +348,11 @@ function updatePlayerStacks() {
     checker.style.backgroundColor = COLORS[2].heavy;
     checker.setAttribute('data-player', 2);
     checker.setAttribute('data-move-type', 'heavy');
-    checker.addEventListener('mousedown', handleMouseDown);
+    if (isTapMode) {
+      checker.addEventListener('click', handleTapStack);
+    } else {
+      checker.addEventListener('mousedown', handleMouseDown);
+    }
     p2HeavyContainer.appendChild(checker);
   }
 }
@@ -457,7 +415,7 @@ function updateDraggableStacks() {
   updatePlayerStacks();
 }
 
-// === Drag-and-Drop Handlers ===
+// === Drag-and-Drop Handlers (for non-tap devices) ===
 function handleMouseDown(e) {
   if (gameOver || this !== this.parentElement.querySelector('.checker') || playerRole !== turn) return;
   e.preventDefault();
@@ -564,7 +522,7 @@ function returnToStack() {
     newChecker.style.backgroundColor = draggedPieceColor;
     newChecker.setAttribute('data-player', player);
     newChecker.setAttribute('data-move-type', currentMoveType);
-    newChecker.addEventListener('mousedown', handleMouseDown);
+    newChecker.addEventListener(isTapMode ? 'click' : 'mousedown', handleTapStack);
     if (labelElem && labelElem.nextSibling) { targetStack.insertBefore(newChecker, labelElem.nextSibling); }
     else { targetStack.appendChild(newChecker); }
     updatePlayerStacks();
@@ -772,7 +730,6 @@ function processRemoteMove(msgObj) {
     : ((oppColor === COLORS[1].light || oppColor === COLORS[1].heavy) ? 'y' : 'r');
   targetRow = (moveType === 'heavy') ? placeHeavyPiece(col, oppPiece) : placeLightPiece(col, oppPiece);
   redrawBoard();
-  let opponent = (playerRole === 1) ? 2 : 1;
   updatePlayerStacks();
   let winData = checkWin();
   if (winData) { endGame(winData); return; }
@@ -793,6 +750,11 @@ createPlayerStacks(1);
 createPlayerStacks(2);
 createBoard();
 createDropZones();
+
+// If in tap mode, add a board tap listener.
+if (isTapMode) {
+  document.getElementById('board').addEventListener('click', handleTapBoard);
+}
 
 document.getElementById("setSecretBtn").addEventListener("click", function(){
   secret = document.getElementById("secretInput").value;
@@ -832,4 +794,4 @@ function resetGame() {
 }
 window.resetGame = resetGame;
 
-// End of light_and_heavy.js v3.10.2
+// End of light_and_heavy.js v3.10.3
