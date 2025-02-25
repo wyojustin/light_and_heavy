@@ -1,4 +1,4 @@
-// light_and_heavy.js v3.10.4
+// light_and_heavy.js v4.0
 console.log("light_and_heavy.js loaded");
 
 // === Constants & Global Variables ===
@@ -21,9 +21,11 @@ let playerRole = null, turn = 1, gameMoveNumber = 1, lastLoser = null;
 const INITIAL_LIGHT = 11;
 const INITIAL_HEAVY = 10;
 
-// === New Global Variables for Tap Mode ===
+// === New Global Variables for Tap Mode and Draw ===
 let selectedMove = null;
 const isTapMode = ('ontouchstart' in window);
+let drawPublished = false; // Prevent duplicate draw messages
+let tempChecker = null;    // Temporary checker element for tap mode
 
 // === Helper Functions ===
 function computeHMAC(message) {
@@ -52,7 +54,7 @@ function clearHandshakeTopics() {
   clearChallengeAccepted();
 }
 
-// Check for a draw condition: return true if no cell is empty.
+// Check for a draw: return true if no cell is empty.
 function checkDraw() {
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
@@ -60,6 +62,18 @@ function checkDraw() {
     }
   }
   return true;
+}
+
+function publishDraw() {
+  if (drawPublished) return;
+  drawPublished = true;
+  const drawObj = { move: gameMoveNumber, type: "draw", clientId: clientId };
+  const payload = JSON.stringify(drawObj);
+  const msg = new Paho.MQTT.Message(payload);
+  msg.destinationName = "light_and_heavy/draw";
+  msg.retained = false;
+  mqttClient.send(msg);
+  console.log("Published draw:", payload);
 }
 
 // === MQTT Setup & Handshake ===
@@ -73,11 +87,10 @@ function onConnect() {
   mqttClient.subscribe("light_and_heavy/challenge");
   mqttClient.subscribe("light_and_heavy/challenge_accepted");
   mqttClient.subscribe("light_and_heavy/move");
+  mqttClient.subscribe("light_and_heavy/draw");
   
-  // Clear any stale handshake messages.
   clearHandshakeTopics();
   
-  // Wait one second for clears to propagate, then send a new challenge.
   setTimeout(() => {
     myNonce = "nonce_" + Math.random().toString(16).substr(2, 8);
     const msgObj = { move: moveNumber, nonce: myNonce, hmac: computeHMAC(moveNumber + myNonce), clientId };
@@ -89,7 +102,6 @@ function onConnect() {
     myChallengePosted = true;
     console.log("Posted challenge:", payload);
     
-    // Set a retry timer if no valid challenge is received.
     setTimeout(() => {
       if (!challengeReceived) {
         myNonce = "nonce_" + Math.random().toString(16).substr(2, 8);
@@ -110,7 +122,6 @@ function onConnect() {
 function onMessageArrived(message) {
   console.log("MQTT message on", message.destinationName, ":", message.payloadString);
   
-  // Guard: skip processing if the payload is empty or only whitespace.
   if (message.payloadString.trim() === "") {
     console.log("Empty message received on", message.destinationName, "- ignoring.");
     return;
@@ -148,7 +159,7 @@ function onMessageArrived(message) {
         mqttClient.send(msg);
         console.log("Published challenge accepted:", payload);
       }
-      clearChallenge(); // Handshake complete, clear challenge.
+      clearChallenge();
     } else {
       console.log("Received invalid challenge or for a different move.");
     }
@@ -170,6 +181,12 @@ function onMessageArrived(message) {
     } else {
       console.log("Received invalid move message.");
     }
+  } else if (message.destinationName === "light_and_heavy/draw") {
+    console.log("Received draw message:", msgObj);
+    gameOver = true;
+    document.getElementById("winMessage").innerText = "Draw";
+    document.getElementById("winOverlay").style.display = "flex";
+    lastLoser = (turn === 1) ? 2 : 1;
   }
 }
 
@@ -191,11 +208,10 @@ function startMQTT() {
 
 // === Tap-Tap Methods for Mobile Devices ===
 function handleTapStack(e) {
-  // Prevent event bubbling so board tap doesn't fire.
   e.stopPropagation();
-  
   if (gameOver || playerRole !== turn) return;
-  
+  // Remove the tapped checker from the stack.
+  this.remove();
   selectedMove = {
     moveType: this.getAttribute('data-move-type'),
     player: parseInt(this.getAttribute('data-player')),
@@ -204,10 +220,6 @@ function handleTapStack(e) {
            : (this.getAttribute('data-move-type') === 'heavy' ? COLORS[2].heavy : COLORS[2].light)
   };
   console.log("Tap mode selected move:", selectedMove);
-  
-  // Add visual indicator.
-  document.querySelectorAll('.checker').forEach(ch => ch.classList.remove('selected'));
-  this.classList.add('selected');
 }
 
 function handleTapBoard(e) {
@@ -215,10 +227,12 @@ function handleTapBoard(e) {
   
   const board = document.getElementById('board');
   const rect = board.getBoundingClientRect();
-  const x = e.clientX - rect.left - 10; // Adjust for board padding.
-  const col = Math.floor(x / 80); // 70px cell + 10px gap = 80px.
+  const x = e.clientX - rect.left - 10;
+  const col = Math.floor(x / 80);
   if (col < 0 || col >= COLS) {
-    console.log("Tap outside valid board area.");
+    console.log("Tap outside valid board area. Restoring piece to stack.");
+    selectedMove = null;
+    updatePlayerStacks();
     return;
   }
   
@@ -230,51 +244,59 @@ function handleTapBoard(e) {
     }
   }
   if (targetRow === -1) {
-    console.log("Column is full.");
+    console.log("Column is full. Restoring piece to stack.");
     selectedMove = null;
-    document.querySelectorAll('.checker').forEach(ch => ch.classList.remove('selected'));
+    updatePlayerStacks();
     return;
   }
   
-  if (selectedMove.moveType === 'heavy') {
-    targetRow = placeHeavyPiece(col, selectedMove.player === 1 ? 'Y' : 'R');
-  } else {
-    targetRow = placeLightPiece(col, selectedMove.player === 1 ? 'y' : 'r');
-  }
+  // Draw temporary checker at target position.
+  const boardContainer = document.getElementById('board-container');
+  const boardRect = board.getBoundingClientRect();
+  const containerRect = boardContainer.getBoundingClientRect();
+  const boardLeft = boardRect.left - containerRect.left;
+  const boardTop = boardRect.top - containerRect.top;
+  const tempLeft = boardLeft + 10 + col * 80;
+  const tempTop = boardTop + 10 + targetRow * 80;
   
-  if (targetRow === null) {
-    console.log("Failed to place piece, returning to stack.");
-    selectedMove = null;
-    document.querySelectorAll('.checker').forEach(ch => ch.classList.remove('selected'));
-    return;
-  }
+  tempChecker = document.createElement('div');
+  tempChecker.classList.add('temp-checker');
+  tempChecker.style.backgroundColor = selectedMove.color;
+  tempChecker.style.left = tempLeft + 'px';
+  tempChecker.style.top = tempTop + 'px';
+  boardContainer.appendChild(tempChecker);
+  
+  // Now, since this is the second tap, we finalize the move.
+  // In a real scenario you might wait for a confirmation tap; here we assume the tap on board is the confirmation.
+  boardState[targetRow][col] = (selectedMove.player === 1) ?
+      (selectedMove.moveType === 'heavy' ? 'Y' : 'y') :
+      (selectedMove.moveType === 'heavy' ? 'R' : 'r');
+  
+  // Remove the temporary checker.
+  tempChecker.remove();
+  tempChecker = null;
   
   redrawBoard();
-  updatePlayerStacks();
   publishMove(col, selectedMove.moveType);
+  updatePlayerStacks();
   
-  // Check for win.
+  // Check win first.
   let winData = checkWin();
   if (winData) {
     endGame(winData);
-  }
-  // Check for draw.
-  else if (checkDraw()) {
+  } else if (checkDraw()) {
+    publishDraw();
     gameOver = true;
     console.log("Game over: Draw");
     document.getElementById("winMessage").innerText = "Draw";
     document.getElementById("winOverlay").style.display = "flex";
-    // For the next game, let the opposite player start.
-    lastLoser = (selectedMove.player === 1) ? 2 : 1;
-  }
-  else {
+    lastLoser = (turn === 1) ? 2 : 1;
+  } else {
     turn = (turn === 1) ? 2 : 1;
     updateDraggableStacks();
     gameMoveNumber++;
   }
-  
   selectedMove = null;
-  document.querySelectorAll('.checker').forEach(ch => ch.classList.remove('selected'));
 }
 
 // === Game Setup & Rendering ===
@@ -543,11 +565,11 @@ document.addEventListener('mouseup', function(e) {
   if (winData) {
     endGame(winData);
   } else if (checkDraw()) {
+    publishDraw();
     gameOver = true;
     console.log("Game over: Draw");
     document.getElementById("winMessage").innerText = "Draw";
     document.getElementById("winOverlay").style.display = "flex";
-    // For next game, let the opposite player start.
     lastLoser = (turn === 1) ? 2 : 1;
   } else {
     turn = (turn === 1) ? 2 : 1;
@@ -805,8 +827,6 @@ createPlayerStacks(1);
 createPlayerStacks(2);
 createBoard();
 createDropZones();
-
-// If in tap mode, add a board tap listener.
 if (isTapMode) {
   document.getElementById('board').addEventListener('click', handleTapBoard);
 }
@@ -837,6 +857,7 @@ function resetGame() {
   console.log("Game reset.");
   challengeReceived = false;
   myChallengePosted = false;
+  drawPublished = false;
   myNonce = "nonce_" + Math.random().toString(16).substr(2, 8);
   console.log("New nonce generated:", myNonce);
   const msgObj = { move: moveNumber, nonce: myNonce, hmac: computeHMAC(moveNumber + myNonce), clientId };
@@ -849,4 +870,4 @@ function resetGame() {
 }
 window.resetGame = resetGame;
 
-// End of light_and_heavy.js v3.10.4
+// End of light_and_heavy.js v4.0
